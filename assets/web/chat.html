@@ -45,7 +45,7 @@
         .ai-message { align-self: flex-start; }
 
         .bubble { padding: 12px 16px; border-radius: 12px; line-height: 1.6; word-wrap: break-word; }
-        .user-message .bubble { background-color: var(--bubble-user-bg); color: white; border-bottom-right-radius: 2px; }
+        .user-message .bubble { background-color: var(--bubble-user-bg); color: white; border-bottom-right-radius: 2px; white-space: pre-wrap; }
         .ai-message .bubble { background-color: var(--bubble-ai-bg); color: var(--text-color); border-bottom-left-radius: 2px; border: 1px solid var(--bubble-ai-border); }
 
         .ai-message .bubble p { margin: 0 0 10px 0; }
@@ -125,8 +125,10 @@
             if (aiMsg) {
                 const bubble = aiMsg.querySelector('.bubble');
                 if (bubble) {
-                    const plainText = bubble.innerText; 
-                    const markdownText = aiMsg.getAttribute('data-raw') || ''; 
+                    const plainText = bubble.innerText;
+                    const markdownText = currentAiBubble && aiMsg.contains(currentAiBubble)
+                        ? currentAiRawText
+                        : (aiMsg.getAttribute('data-raw') || '');
                     if (bridge) {
                         bridge.triggerContextMenu(plainText, markdownText);
                     }
@@ -142,9 +144,25 @@
         window.addUserMessage = function(text) {
             const msgDiv = document.createElement('div');
             msgDiv.className = 'message user-message';
-            msgDiv.innerHTML = `<div class="bubble">${text.replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/\n/g, "<br>")}</div>`;
+            const bubble = document.createElement('div');
+            bubble.className = 'bubble';
+            bubble.textContent = text;
+            msgDiv.appendChild(bubble);
             document.getElementById('chat-container').appendChild(msgDiv);
             scrollToBottom();
+        };
+
+        window.removeLastAiMessage = function() {
+            const container = document.getElementById('chat-container');
+            const lastMsg = container.lastElementChild;
+            if (lastMsg && lastMsg.classList.contains('ai-message')) {
+                lastMsg.remove();
+            }
+            currentAiBubble = null;
+            currentAiRawText = "";
+            currentAiThinkingText = "";
+            currentThinkingBlock = null;
+            currentThinkingContent = null;
         };
 
         window.startAiMessage = function() {
@@ -183,10 +201,6 @@
             }
             currentAiRawText += token;
             currentAiBubble.innerHTML = md.render(currentAiRawText);
-            
-            const aiMsg = currentAiBubble.closest('.ai-message');
-            if (aiMsg) aiMsg.setAttribute('data-raw', currentAiRawText);
-            
             scrollToBottom();
         };
 
@@ -218,7 +232,10 @@
         
         window.showError = function(errMsg) {
             if (currentAiBubble) {
-                currentAiBubble.innerHTML = `<span style="color: #ff4d4f;">❌ 请求失败: ${errMsg}</span>`;
+                const errorSpan = document.createElement('span');
+                errorSpan.style.color = '#ff4d4f';
+                errorSpan.textContent = `❌ 请求失败: ${errMsg}`;
+                currentAiBubble.replaceChildren(errorSpan);
                 currentAiBubble = null;
             }
         }
@@ -242,7 +259,7 @@
                 const bubble = document.createElement('div');
                 bubble.className = 'bubble';
                 if (msg.role === 'user') {
-                    bubble.innerHTML = msg.content.replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/\n/g, "<br>");
+                    bubble.textContent = msg.content;
                 } else {
                     bubble.innerHTML = md.render(msg.content);
                     const pres = bubble.querySelectorAll('pre');
@@ -270,19 +287,27 @@
             const container = document.getElementById('chat-container');
             const lastMsg = container.lastElementChild;
             if (lastMsg && lastMsg.classList.contains('ai-message') && !lastMsg.querySelector('.usage-info')) {
+                const tokenCount = value => Number.isFinite(value) && value >= 0 ? Math.trunc(value) : 0;
                 const metaDiv = document.createElement('div');
                 metaDiv.className = 'usage-info';
-                let text = `⏱️ 耗时: ${elapsed.toFixed(2)}s`;
+                const seconds = Number.isFinite(elapsed) ? elapsed : 0;
+                let text = `⏱️ 耗时: ${seconds.toFixed(2)}s`;
                 if (usage) {
-                    const prompt = usage.prompt_tokens || 0;
-                    const completion = usage.completion_tokens || 0;
-                    const total = usage.total_tokens || (prompt + completion);
+                    const prompt = tokenCount(usage.prompt_tokens);
+                    const completion = tokenCount(usage.completion_tokens);
+                    const total = tokenCount(usage.total_tokens) || (prompt + completion);
                     text += ` | ⚡ Tokens: ${prompt} 提示 + ${completion} 回复 = ${total} 总计`;
-                    if (cachedTokens > 0) {
-                        text += ` | <span style="color: #4ade80; font-weight: bold;">💾 缓存命中: ${cachedTokens}</span>`;
-                    }
                 }
-                metaDiv.innerHTML = text; 
+                metaDiv.textContent = text;
+                const cached = tokenCount(cachedTokens);
+                if (cached > 0) {
+                    const cachedSpan = document.createElement('span');
+                    cachedSpan.style.color = '#4ade80';
+                    cachedSpan.style.fontWeight = 'bold';
+                    cachedSpan.textContent = `💾 缓存命中: ${cached}`;
+                    metaDiv.appendChild(document.createTextNode(' | '));
+                    metaDiv.appendChild(cachedSpan);
+                }
                 lastMsg.appendChild(metaDiv);
                 scrollToBottom();
             }

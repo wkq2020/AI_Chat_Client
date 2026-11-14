@@ -10,13 +10,14 @@ else:
     # 如果是开发环境，BASE_DIR 为项目根目录
     BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
 
-DB_DIR = os.path.join(BASE_DIR, 'data')
+DB_DIR = os.environ.get('AI_CHAT_DATA_DIR', os.path.join(BASE_DIR, 'data'))
 DB_PATH = os.path.join(DB_DIR, 'chat.db')
 
 def get_connection():
     os.makedirs(DB_DIR, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row 
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
     return conn
 
 def init_db():
@@ -40,7 +41,11 @@ def init_db():
             FOREIGN KEY (session_id) REFERENCES sessions (id) ON DELETE CASCADE
         )
     ''')
-    
+    cursor.execute('''
+        CREATE INDEX IF NOT EXISTS idx_messages_session_order
+        ON messages(session_id, created_at)
+    ''')
+
     # 【核心新增】数据迁移：检查并添加 system_prompt 字段，兼容旧数据库
     cursor.execute("PRAGMA table_info(sessions)")
     columns = [info[1] for info in cursor.fetchall()]

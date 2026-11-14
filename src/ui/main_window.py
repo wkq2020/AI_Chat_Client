@@ -85,6 +85,11 @@ class MainWindow(QWidget):
     def _connect_signals(self):
         self.sidebar.newChatBtn.clicked.connect(self._create_new_session)
         self.sidebar.session_selected.connect(self._on_session_selected)
+        self.sidebar.session_deleting.connect(self.chat_view.remove_session)
+        self.chat_view.session_created.connect(self._on_chat_session_created)
+
+    def _on_chat_session_created(self, session_id):
+        self.sidebar.refresh_sessions(select_id=session_id)
 
     def _create_new_session(self):
         new_id = session_dao.create_session("新对话")
@@ -93,3 +98,7 @@ class MainWindow(QWidget):
 
     def _on_session_selected(self, session_id):
         self.chat_view.load_session(session_id)
+
+    def closeEvent(self, event):
+        self.chat_view.shutdown()
+        super().closeEvent(event)

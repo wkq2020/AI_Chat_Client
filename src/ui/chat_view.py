@@ -48,8 +48,9 @@ class ChatView(QWidget):
         self.current_models = [] 
         
         # 【核心重构】多会话独立状态字典，彻底隔离每个会话的数据
-        self.session_states = {} 
-        
+        self.session_states = {}
+        self._retired_workers = []
+
         self.flush_timer = QTimer(self)
         self.flush_timer.setInterval(50) 
         self.flush_timer.timeout.connect(self._flush_token_buffer)
@@ -71,8 +72,9 @@ class ChatView(QWidget):
     def _get_default_state(self):
         return {
             "full_text": "", "thinking_text": "", "buffer": "", "thinking_buffer": "",
-            "usage": None, "cached_tokens": 0, "is_generating": False, 
-            "worker": None, "start_time": 0, "show_thinking": False
+            "usage": None, "cached_tokens": 0, "is_generating": False,
+            "worker": None, "start_time": 0, "show_thinking": False,
+            "is_regenerate": False, "stop_requested": False
         }
 
     def _init_ui(self):
@@ -171,10 +173,13 @@ class ChatView(QWidget):
     def _handle_regenerate(self):
         if not self.current_session_id: return
         state = self.session_states.get(self.current_session_id)
-        if state and state["is_generating"]: return
+        if state and (state["is_generating"] or state["stop_requested"]): return
         messages = message_dao.get_messages_by_session(self.current_session_id)
-        last_user_msg = next((m['content'] for m in reversed(messages) if m['role'] == 'user'), None)
-        if last_user_msg: self._do_send_message(last_user_msg, is_regenerate=True)
+        if not messages or messages[-1]['role'] != 'assistant':
+            return
+        last_user_msg = next((m['content'] for m in reversed(messages[:-1]) if m['role'] == 'user'), None)
+        if last_user_msg:
+            self._do_send_message(last_user_msg, is_regenerate=True)
 
     def _update_context_label(self):
         input_text = self.inputBox.toPlainText()
@@ -283,7 +288,7 @@ class ChatView(QWidget):
             if self.pending_session_id is not None:
                 sid = self.pending_session_id
                 self.pending_session_id = None
-                QTimer.singleShot(150, lambda: self._do_load_session(sid))
+                QTimer.singleShot(150, self, lambda sid=sid: self._do_load_session(sid))
 
     def apply_html_theme(self, theme=None):
         """【修复】直接根据传入的 theme 参数判断 HTML 主题"""
@@ -386,6 +391,10 @@ class ChatView(QWidget):
     # 【核心重构】会话切换：不杀 Worker，实现后台静默与无缝续传
     # =====================================================================
     def load_session(self, session_id):
+        if self.sys_prompt_timer.isActive():
+            self.sys_prompt_timer.stop()
+            self._save_system_prompt()
+
         # 1. 停止旧会话的 UI 渲染定时器 (但不杀 Worker，让它在后台继续跑)
         if self.flush_timer.isActive():
             self.flush_timer.stop()
@@ -416,10 +425,43 @@ class ChatView(QWidget):
                 state["buffer"] = ""
                 state["thinking_buffer"] = ""
                 self.flush_timer.start()
+            elif state["stop_requested"]:
+                self._set_stop_button_state()
+                self.sendBtn.setEnabled(False)
             else:
                 self._reset_send_button()
         else:
             self._reset_send_button()
+
+    def remove_session(self, session_id):
+        if session_id == self.current_session_id and self.sys_prompt_timer.isActive():
+            self.sys_prompt_timer.stop()
+            self._save_system_prompt()
+
+        state = self.session_states.pop(session_id, None)
+        if state:
+            self._cleanup_worker(state.get("worker"))
+
+        if session_id == self.current_session_id:
+            self.flush_timer.stop()
+            self.sys_prompt_timer.stop()
+            self.current_session_id = None
+            self.pending_session_id = None
+            self._do_load_session(None)
+            self._reset_send_button()
+
+    def shutdown(self):
+        if self.sys_prompt_timer.isActive():
+            self.sys_prompt_timer.stop()
+            self._save_system_prompt()
+        self.flush_timer.stop()
+        for session_id, state in list(self.session_states.items()):
+            self._persist_assistant_response(session_id, state)
+            state["is_generating"] = False
+            self._cleanup_worker(state.get("worker"))
+        for worker in list(self._retired_workers):
+            self._cleanup_worker(worker)
+        self.session_states.clear()
 
     def _on_sys_prompt_changed(self):
         """当系统指令文本框内容改变时，重置防抖定时器"""
@@ -461,7 +503,6 @@ class ChatView(QWidget):
     def _on_send_clicked(self):
         text = self.inputBox.toPlainText().strip()
         if not text: return
-        self.inputBox.clear()
         self._do_send_message(text, is_regenerate=False)
 
     def _do_send_message(self, text, is_regenerate=False):
@@ -469,7 +510,9 @@ class ChatView(QWidget):
         if not current_api: QMessageBox.warning(self, "配置错误", "请先在左下角【设置】中添加并配置 API！"); return
         current_model_dict = self._get_current_model_dict()
         if not current_model_dict: QMessageBox.warning(self, "配置错误", "当前 API 下没有配置任何可用模型！"); return
-            
+
+        if not is_regenerate:
+            self.inputBox.clear()
         API_KEY = current_api["api_key"]
         BASE_URL = current_api["base_url"]
         model = current_model_dict.get('id')
@@ -496,13 +539,19 @@ class ChatView(QWidget):
         state["cached_tokens"] = 0
         state["start_time"] = time.time()
         state["show_thinking"] = self.thinkingSwitch.isChecked() and self.thinkingSwitch.isEnabled()
-        
+        state["is_regenerate"] = is_regenerate
+        state["stop_requested"] = False
+
+        if is_regenerate:
+            self._call_js("removeLastAiMessage")
         self._call_js("startAiMessage")
         
         enable_search = self.searchSwitch.isChecked() and self.searchSwitch.isEnabled()
         sys_prompt = self.sysPromptBox.toPlainText().strip()
         history = message_dao.get_messages_by_session(self.current_session_id)
-        
+        if is_regenerate and history and history[-1]['role'] == 'assistant':
+            history = history[:-1]
+
         def estimate_tokens(t): return len(t) // 2
         is_cache_enabled = self.cacheSwitch.isChecked() and self.cacheSwitch.isEnabled()
         MAX_BREAKPOINTS = 4
@@ -531,9 +580,7 @@ class ChatView(QWidget):
                         msg["content"] = [{"type": "text", "text": content_text, "cache_control": {"type": "ephemeral"}}]
                         cache_breakpoints += 1
                         break
-            messages.extend(raw_messages)
-        else:
-            messages = raw_messages
+        messages.extend(raw_messages)
 
         is_partial = self.partialSwitch.isChecked() and self.partialSwitch.isEnabled()
         if is_partial:
@@ -571,16 +618,18 @@ class ChatView(QWidget):
         
         self._set_stop_button_state()
 
+    def _persist_assistant_response(self, session_id, state):
+        if not state["full_text"] or not state["is_generating"]:
+            return
+        if state.get("is_regenerate"):
+            message_dao.replace_last_assistant(session_id, state["full_text"])
+        else:
+            message_dao.add_message(session_id, "assistant", state["full_text"])
+
     def _cleanup_worker(self, worker):
-        """【修复】安全停止 Worker 并释放资源，防止竞态条件和内存泄漏"""
         if worker is None:
             return
-        # 1. 通知线程停止
-        if worker.isRunning():
-            worker.stop()
-            # 等待线程结束，最多 3 秒，防止卡死在 httpx 阻塞中
-            worker.wait(3000)
-        # 2. 断开所有信号，防止旧 Worker 的信号继续触发 slot
+        worker.stop()
         try:
             worker.thinking_received.disconnect()
             worker.token_received.disconnect()
@@ -589,8 +638,22 @@ class ChatView(QWidget):
             worker.error_occurred.disconnect()
         except (RuntimeError, TypeError):
             pass
-        # 3. 标记为稍后删除，让 Qt 事件循环安全回收 QThread 对象
+
+        if worker.isRunning() and not worker.wait(3000):
+            if worker not in self._retired_workers:
+                self._retired_workers.append(worker)
+                worker.finished.connect(worker.deleteLater)
+                worker.finished.connect(lambda worker=worker: self._forget_retired_worker(worker))
+            return
+
+        self._forget_retired_worker(worker)
         worker.deleteLater()
+
+    def _forget_retired_worker(self, worker):
+        try:
+            self._retired_workers.remove(worker)
+        except ValueError:
+            pass
 
     def _set_stop_button_state(self):
         self.sendBtn.setText("停止")
@@ -608,41 +671,44 @@ class ChatView(QWidget):
         self.sendBtn.setEnabled(True)
 
     def _on_stop_clicked(self):
-        """【修复】停止生成时紧急保存已生成的部分内容到数据库"""
-        if self.current_session_id and self.current_session_id in self.session_states:
-            state = self.session_states[self.current_session_id]
-            if state["worker"] and state["worker"].isRunning():
-                state["worker"].stop()
-                # 紧急保存已生成的部分内容，防止数据丢失
-                if state["full_text"]:
-                    message_dao.add_message(self.current_session_id, "assistant", state["full_text"])
-                state["is_generating"] = False
-        self.sendBtn.setEnabled(False)
-        # 【修复】安全网：如果 Worker 线程卡在 httpx 阻塞中无法触发 stream_finished，
-        # 3.5 秒后强制重置 UI，防止按钮永远卡在“停止”状态
-        QTimer.singleShot(3500, self._force_reset_ui_after_stop)
-
-    def _force_reset_ui_after_stop(self):
-        """【修复】安全网：当 Worker 线程卡死无法触发 stream_finished 时，强制恢复 UI"""
-        if not self.current_session_id: return
-        state = self.session_states.get(self.current_session_id)
-        if state and not state["is_generating"]:
-            # 已经正常结束了，无需处理
+        if not self.current_session_id or self.current_session_id not in self.session_states:
             return
-        # Worker 卡死，强制重置
-        if state:
-            state["is_generating"] = False
+        session_id = self.current_session_id
+        state = self.session_states[session_id]
+        worker = state.get("worker")
+        if not state["is_generating"]:
+            return
+
+        state["stop_requested"] = True
+        if worker and worker.isRunning():
+            worker.stop()
+        self._persist_assistant_response(session_id, state)
+        state["is_generating"] = False
+        self.sendBtn.setEnabled(False)
+        QTimer.singleShot(
+            3500,
+            self,
+            lambda session_id=session_id, worker=worker: self._force_reset_ui_after_stop(session_id, worker)
+        )
+
+    def _force_reset_ui_after_stop(self, session_id, worker):
+        state = self.session_states.get(session_id)
+        if not state or not state["stop_requested"] or state.get("worker") is not worker:
+            return
+
+        state["stop_requested"] = False
+        state["is_generating"] = False
+        self._cleanup_worker(worker)
+        state["worker"] = None
+
+        if session_id == self.current_session_id:
             if self.flush_timer.isActive(): self.flush_timer.stop()
             self._flush_token_buffer()
-            self._call_js("finishAiMessage")
-            # 强制清理卡死的 Worker
-            worker = state.get("worker")
-            if worker:
-                worker.stop()
-                worker.wait(1000)
-                self._cleanup_worker(worker)
-                state["worker"] = None
-        self._reset_send_button()
+            if state.get("is_regenerate") and not state["full_text"]:
+                self._do_load_session(session_id)
+            else:
+                self._call_js("finishAiMessage")
+            self._reset_send_button()
 
     # =====================================================================
     # 【核心重构】信号接收器：数据存入独立 State，按需渲染 UI
@@ -650,6 +716,7 @@ class ChatView(QWidget):
     def _on_thinking_received(self, token: str, session_id: str):
         if session_id not in self.session_states: return
         state = self.session_states[session_id]
+        if not state["is_generating"]: return
         state["thinking_text"] += token
         state["thinking_buffer"] += token
         if session_id == self.current_session_id and state["show_thinking"]:
@@ -658,10 +725,18 @@ class ChatView(QWidget):
     def _on_token_received(self, token: str, session_id: str):
         if session_id not in self.session_states: return
         state = self.session_states[session_id]
+        if not state["is_generating"]: return
         state["full_text"] += token
         state["buffer"] += token
         if session_id == self.current_session_id:
+            self._update_flush_interval(state)
             if not self.flush_timer.isActive(): self.flush_timer.start()
+
+    def _update_flush_interval(self, state):
+        length = len(state["full_text"])
+        interval = 250 if length > 32768 else 120 if length > 8192 else 50
+        if self.flush_timer.interval() != interval:
+            self.flush_timer.setInterval(interval)
 
     def _flush_token_buffer(self):
         if not self.current_session_id: return
@@ -693,10 +768,9 @@ class ChatView(QWidget):
         state = self.session_states[session_id]
         
         # 【修复】防止 _on_stop_clicked 已经保存过的重复存库
-        if state["full_text"] and state["is_generating"]:
-            message_dao.add_message(session_id, "assistant", state["full_text"])
-            
+        self._persist_assistant_response(session_id, state)
         state["is_generating"] = False
+        state["stop_requested"] = False
         
         # 【修复】异步清理 Worker 资源，释放 QThread 内存
         if state.get("worker"):
@@ -706,12 +780,17 @@ class ChatView(QWidget):
         # 2. 只有当前会话才更新 UI
         if session_id == self.current_session_id:
             if self.flush_timer.isActive(): self.flush_timer.stop()
-            self._flush_token_buffer() 
-            
-            self._call_js("finishAiMessage")
+            self._flush_token_buffer()
+
+            empty_regenerate = state.get("is_regenerate") and not state["full_text"]
+            if empty_regenerate:
+                self._do_load_session(session_id)
+            else:
+                self._call_js("finishAiMessage")
             elapsed = time.time() - state["start_time"] if state["start_time"] > 0 else 0
             self._reset_send_button()
-            self._call_js("showMeta", state["usage"], elapsed, state["cached_tokens"])
+            if not empty_regenerate:
+                self._call_js("showMeta", state["usage"], elapsed, state["cached_tokens"])
             self._update_context_label()
 
     def _on_error_occurred(self, error_msg: str, session_id: str):
@@ -719,9 +798,9 @@ class ChatView(QWidget):
         state = self.session_states[session_id]
         
         # 【修复】错误时也紧急保存已生成的部分内容
-        if state["full_text"] and state["is_generating"]:
-            message_dao.add_message(session_id, "assistant", state["full_text"])
+        self._persist_assistant_response(session_id, state)
         state["is_generating"] = False
+        state["stop_requested"] = False
         
         # 【修复】异步清理 Worker 资源
         if state.get("worker"):
@@ -731,5 +810,7 @@ class ChatView(QWidget):
         if session_id == self.current_session_id:
             if self.flush_timer.isActive(): self.flush_timer.stop()
             self._flush_token_buffer()
+            if state.get("is_regenerate") and not state["full_text"]:
+                self._do_load_session(session_id)
             self._call_js("showError", error_msg)
             self._reset_send_button()

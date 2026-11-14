@@ -155,14 +155,19 @@ class SettingsDialog(QDialog):
         self._refresh_api_list()
 
     def _refresh_api_list(self, select_id=None):
+        if select_id is None:
+            current_api = self.config.get_current_api()
+            select_id = current_api['id'] if current_api else None
         self.api_list.clear()
         apis = self.config.get_apis()
         for api in apis:
             item = QListWidgetItem(api['name'])
-            item.setData(100, api['id']) 
+            item.setData(100, api['id'])
             self.api_list.addItem(item)
             if select_id == api['id']:
                 self.api_list.setCurrentItem(item)
+        if apis and self.api_list.currentItem() is None:
+            self.api_list.setCurrentRow(0)
         if not apis:
             self._clear_form()
 
@@ -177,6 +182,9 @@ class SettingsDialog(QDialog):
             self.key_edit.setText(api['api_key'])
             self.current_models = api.get('models', [])
             self._refresh_model_list()
+            if self.config.config.get("current_api_id") != api_id:
+                self.config.set_current_api(api_id)
+                signal_bus.config_updated.emit()
 
     def _clear_form(self):
         self.name_edit.clear(); self.url_edit.clear(); self.key_edit.clear()

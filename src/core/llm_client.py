@@ -1,14 +1,60 @@
 import httpx
 import json
+import math
 import os
 from datetime import datetime
 
 # 【新增】调试日志目录配置
-DEBUG_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'data', 'debug')
+DEBUG_DIR = os.path.join(
+    os.environ.get('AI_CHAT_DATA_DIR', os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'data')),
+    'debug'
+)
 os.makedirs(DEBUG_DIR, exist_ok=True)
 
 # 【新增】调试开关 (自测时设为 True，打包发布时建议设为 False)
-ENABLE_DEBUG_LOG = False 
+ENABLE_DEBUG_LOG = False
+
+
+def build_chat_completions_url(base_url: str) -> str:
+    url = base_url.strip().rstrip('/')
+    if url.endswith('/chat/completions'):
+        return url
+    if url.endswith('/v1'):
+        return f"{url}/chat/completions"
+    return f"{url}/v1/chat/completions"
+
+
+def _non_negative_int(value) -> int:
+    if isinstance(value, bool):
+        return 0
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+    if not math.isfinite(number) or number < 0:
+        return 0
+    return int(number)
+
+
+def normalize_usage(usage: dict) -> dict:
+    if not isinstance(usage, dict):
+        return {}
+
+    normalized = dict(usage)
+    for key in ("prompt_tokens", "completion_tokens", "total_tokens", "cache_read_input_tokens"):
+        if key in normalized:
+            normalized[key] = _non_negative_int(normalized[key])
+
+    details = normalized.get("prompt_tokens_details")
+    if isinstance(details, dict):
+        details = dict(details)
+        if "cached_tokens" in details:
+            details["cached_tokens"] = _non_negative_int(details["cached_tokens"])
+        normalized["prompt_tokens_details"] = details
+    elif details is not None:
+        normalized["prompt_tokens_details"] = {}
+    return normalized
+
 
 def log_debug(session_id, payload, response_chunks, error_msg=None):
     """将请求和响应保存为 JSON 文件"""
@@ -39,10 +85,8 @@ def log_debug(session_id, payload, response_chunks, error_msg=None):
 
 
 def stream_chat(api_key: str, base_url: str, model: str, messages: list, session_id: str, enable_search: bool = False, thinking_config: dict = None, client: httpx.Client = None):
-    url = base_url.rstrip('/')
-    if not url.endswith('/chat/completions'):
-        url = f"{url}/v1/chat/completions"
-        
+    url = build_chat_completions_url(base_url)
+
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json"
@@ -89,22 +133,26 @@ def stream_chat(api_key: str, base_url: str, model: str, messages: list, session
             client = httpx.Client(timeout=120.0)
         try:
             with client.stream("POST", url, json=payload, headers=headers) as response:
+                if response.is_error:
+                    response.read()
                 response.raise_for_status()
-                
+
                 for line in response.iter_lines():
                     if not line.strip(): continue
-                    if line.startswith("data: "):
-                        data_str = line[6:]
-                        if data_str == "[DONE]": 
+                    if line.startswith("data:"):
+                        data_str = line[5:].lstrip()
+                        if data_str == "[DONE]":
                             response_chunks.append({"type": "DONE"})
                             break
                         try:
                             data = json.loads(data_str)
+                            if not isinstance(data, dict):
+                                continue
                             # 将原始解析后的 dict 存入日志
                             response_chunks.append(data)
-                            
+
                             if "usage" in data and data["usage"]:
-                                yield {"type": "usage", "data": data["usage"]}
+                                yield {"type": "usage", "data": normalize_usage(data["usage"])}
                                 continue
                             choices = data.get("choices", [])
                             if choices:

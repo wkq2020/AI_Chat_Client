@@ -1,14 +1,18 @@
+import copy
 import json
 import os
+import stat
 import uuid
 import sys
+
+from src.core import secret_store
 
 if getattr(sys, 'frozen', False):
     BASE_DIR = os.path.dirname(sys.executable)
 else:
     BASE_DIR = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
 
-CONFIG_DIR = os.path.join(BASE_DIR, 'data')
+CONFIG_DIR = os.environ.get('AI_CHAT_DATA_DIR', os.path.join(BASE_DIR, 'data'))
 CONFIG_PATH = os.path.join(CONFIG_DIR, 'config.json')
 
 # 【扩充】官方预设主题包配置
@@ -65,12 +69,36 @@ class ConfigManager:
     def _load(self):
         os.makedirs(CONFIG_DIR, exist_ok=True)
         if not os.path.exists(CONFIG_PATH):
-            self.config = DEFAULT_CONFIG
+            self.config = copy.deepcopy(DEFAULT_CONFIG)
             self._save()
         else:
             with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
                 self.config = json.load(f)
-            self._migrate_data() # 【新增】数据迁移
+            self._migrate_api_keys()
+            self._migrate_data()
+
+    def _migrate_api_keys(self):
+        changed = False
+        for api in self.config.get("apis", []):
+            if "api_key" not in api:
+                continue
+            try:
+                secret_store.set_api_key(api["id"], api["api_key"])
+            except RuntimeError:
+                continue
+            del api["api_key"]
+            changed = True
+        if changed:
+            self._save()
+
+    @staticmethod
+    def _store_api_key(api, api_key):
+        try:
+            secret_store.set_api_key(api["id"], api_key)
+        except RuntimeError:
+            api["api_key"] = api_key
+        else:
+            api.pop("api_key", None)
 
     def _migrate_data(self):
         """自动将旧版的字符串模型列表迁移为新版的能力字典，并补充思考控制字段"""
@@ -89,12 +117,26 @@ class ConfigManager:
             self._save()
 
     def _save(self):
-        with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
+        temp_path = f"{CONFIG_PATH}.tmp"
+        with open(temp_path, 'w', encoding='utf-8') as f:
             json.dump(self.config, f, ensure_ascii=False, indent=4)
+        os.replace(temp_path, CONFIG_PATH)
+        try:
+            os.chmod(CONFIG_PATH, stat.S_IRUSR | stat.S_IWUSR)
+        except OSError:
+            pass
 
     def get_theme(self): return self.config.get("theme", "Dark")
     def set_theme(self, theme): self.config["theme"] = theme; self._save()
-    def get_apis(self): return self.config.get("apis", [])
+    def get_apis(self):
+        apis = copy.deepcopy(self.config.get("apis", []))
+        for api in apis:
+            if "api_key" not in api:
+                try:
+                    api["api_key"] = secret_store.get_api_key(api["id"])
+                except RuntimeError:
+                    api["api_key"] = ""
+        return apis
     
     def get_current_api(self):
         apis = self.get_apis()
@@ -107,7 +149,8 @@ class ConfigManager:
 
     def add_api(self, name, base_url, api_key):
         api_id = str(uuid.uuid4())
-        api = {"id": api_id, "name": name, "base_url": base_url, "api_key": api_key, "models": []}
+        api = {"id": api_id, "name": name, "base_url": base_url, "models": []}
+        self._store_api_key(api, api_key)
         self.config.setdefault("apis", []).append(api)
         if not self.config.get("current_api_id"): self.config["current_api_id"] = api_id
         self._save()
@@ -116,12 +159,17 @@ class ConfigManager:
     def update_api(self, api_id, name, base_url, api_key, models):
         for api in self.config.get("apis", []):
             if api["id"] == api_id:
-                api.update({"name": name, "base_url": base_url, "api_key": api_key, "models": models})
+                api.update({"name": name, "base_url": base_url, "models": models})
+                self._store_api_key(api, api_key)
                 break
         self._save()
 
     def delete_api(self, api_id):
         self.config["apis"] = [a for a in self.config.get("apis", []) if a["id"] != api_id]
+        try:
+            secret_store.delete_api_key(api_id)
+        except RuntimeError:
+            pass
         if self.config.get("current_api_id") == api_id:
             self.config["current_api_id"] = self.config["apis"][0]["id"] if self.config["apis"] else ""
         self._save()

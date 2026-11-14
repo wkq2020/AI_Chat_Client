@@ -14,10 +14,36 @@ def add_message(session_id, role, content):
     finally:
         conn.close()
 
+def replace_last_assistant(session_id, content):
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT id, role FROM messages WHERE session_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            (session_id,)
+        ).fetchone()
+        if row and row["role"] == "assistant":
+            conn.execute(
+                "UPDATE messages SET content = ?, created_at = CURRENT_TIMESTAMP WHERE id = ?",
+                (content, row["id"])
+            )
+            message_id = row["id"]
+        else:
+            message_id = str(uuid.uuid4())
+            conn.execute(
+                "INSERT INTO messages (id, session_id, role, content) VALUES (?, ?, 'assistant', ?)",
+                (message_id, session_id, content)
+            )
+        conn.commit()
+        touch_session(session_id)
+        return message_id
+    finally:
+        conn.close()
+
+
 def get_messages_by_session(session_id):
     conn = get_connection()
     try:
-        cursor = conn.execute("SELECT role, content FROM messages WHERE session_id = ? ORDER BY created_at ASC", 
+        cursor = conn.execute("SELECT role, content FROM messages WHERE session_id = ? ORDER BY created_at ASC, rowid ASC",
                               (session_id,))
         messages = [dict(row) for row in cursor.fetchall()]
         return messages

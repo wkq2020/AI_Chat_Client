@@ -8,7 +8,8 @@ from src.core.config_manager import BASE_DIR
 from src.ui.settings_dialog import SettingsDialog
 
 class Sidebar(QWidget):
-    session_selected = Signal(str) 
+    session_selected = Signal(str)
+    session_deleting = Signal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -138,26 +139,25 @@ class Sidebar(QWidget):
                 session_dao.update_session_title(session_id, new_title.strip())
                 self.refresh_sessions(select_id=session_id)
         elif action == delete_action:
-            # 【修复】检查是否删除的是当前查看的会话
-            current_item = self.chatList.currentItem()
-            was_current = current_item and current_item.data(Qt.UserRole) == session_id
-            
-            session_dao.delete_session(session_id)
-            
-            if self.chatList.count() == 0:
-                # 列表已空，通知 ChatView 清空
-                self.session_selected.emit("")
-            elif was_current:
-                # 【修复】删除的是当前查看的会话，自动切换到列表第一个
-                self.refresh_sessions()
-                first_item = self.chatList.item(0)
-                if first_item:
-                    self.chatList.setCurrentItem(first_item)
-                    self.session_selected.emit(first_item.data(Qt.UserRole))
-            else:
-                # 删除的不是当前会话，只刷新列表即可
-                current_id = current_item.data(Qt.UserRole) if current_item else None
-                self.refresh_sessions(select_id=current_id)
+            self._delete_session(session_id)
+
+    def _delete_session(self, session_id):
+        current_item = self.chatList.currentItem()
+        current_id = current_item.data(Qt.UserRole) if current_item else None
+        was_current = current_id == session_id
+
+        self.session_deleting.emit(session_id)
+        session_dao.delete_session(session_id)
+        self.refresh_sessions()
+
+        if self.chatList.count() == 0:
+            self.session_selected.emit("")
+        elif was_current:
+            first_item = self.chatList.item(0)
+            self.chatList.setCurrentItem(first_item)
+            self.session_selected.emit(first_item.data(Qt.UserRole))
+        elif current_id:
+            self.refresh_sessions(select_id=current_id)
 
     def _open_settings(self):
         dialog = SettingsDialog(self)
